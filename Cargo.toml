@@ -1,0 +1,46 @@
+[package]
+name = "airlock"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Sandbox Claude Code (and other agents) in fast, disposable microVMs via smolvm"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/confidential-ai/airlock"
+keywords = ["microvm", "sandbox", "claude", "smolvm", "agent"]
+categories = ["command-line-utilities", "virtualization"]
+
+[[bin]]
+name = "airlock"
+path = "src/main.rs"
+
+[lib]
+name = "airlock"
+path = "src/lib.rs"
+
+[dependencies]
+# CLI parsing
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+# Serialization: config (toml), fleet index + smolvm `machine ls --json` (json)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# Error handling: thiserror for the library surface, anyhow at the bin boundary
+thiserror = "1"
+anyhow = "1"
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Cross-platform config/state/data directories (XDG on Linux)
+directories = "5"
+# .env parsing WITHOUT mutating the process environment (we inject as launch-time refs)
+dotenvy = "0.15"
+# Locate host binaries for the `status` doctor (smolvm, docker, ssh, ...)
+which = "6"
+
+[dev-dependencies]
+# Isolated temp dirs for unit tests that touch the filesystem layout
+tempfile = "3"
+
+[profile.release]
+strip = true

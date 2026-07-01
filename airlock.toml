@@ -1,0 +1,54 @@
+# airlock.toml — profile for microVM-sandboxed Claude Code
+# Every field has a sensible default; delete what you don't need.
+
+name = "airlock"
+
+[image]
+base = "ubuntu:24.04"
+# tag = "airlock/airlock:latest"   # defaults to this
+# registry = "ghcr.io/you"        # push here + boot from it; enables `airlock checkpoint`
+
+[image.toolchains]
+claude = true
+rust = true
+go = true
+node = true      # includes TypeScript / npm / pnpm
+kubectl = true
+gh = true
+
+# [image.versions]                # pin toolchains; omit for built-in defaults
+# go = "1.26.0"
+# node = "22"
+# kubectl = "1.31.0"
+# rust = "stable"
+
+[image.claude_settings]
+# Non-secret Claude config baked into the image (credentials are NEVER baked).
+# source = "~/.claude"
+include = ["settings.json", "CLAUDE.md", "agents", "skills"]
+
+[resources]
+cpus = 4
+memory = 8192     # MiB
+
+[network]
+policy = "all"    # "off" | "all" | "allow"
+# When policy = "allow", restrict egress to these:
+# allow_hosts = ["api.anthropic.com", "github.com", "registry.npmjs.org"]
+# allow_cidrs = []
+
+[secrets]
+# Secrets are injected at launch — never baked into the image or a checkpoint.
+env_file = ".env"                          # inject KEY=VALUE pairs (if the file exists)
+github = true                              # inject `gh auth token` as GH_TOKEN
+anthropic_api_key_env = "ANTHROPIC_API_KEY"  # inject this host env var if present
+claude_credentials = true                  # copy ~/.claude/.credentials.json if present
+# kubeconfig = "~/.kube/config"            # copy into the guest ~/.kube/config
+
+[ssh]
+base_port = 2200   # member NN forwards host port base_port+NN to guest :22
+user = "dev"
+
+[mounts]
+# Host directories shared into every VM (HOST:GUEST[:ro]):
+volumes = []

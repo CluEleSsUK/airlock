@@ -1,0 +1,4 @@
+/target
+# Airlock-generated build contexts / staged image inputs, if a user runs inside the repo
+/.airlock
+*.smolmachine
