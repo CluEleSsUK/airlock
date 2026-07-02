@@ -97,6 +97,15 @@ pub struct UpArgs {
     /// Rebuild the base image before creating VMs.
     #[arg(long)]
     pub rebuild: bool,
+    /// Bind-mount a host dir into each VM (live): `HOST[:GUEST]`. Repeatable.
+    #[arg(long = "bind", value_name = "HOST[:GUEST]")]
+    pub bind: Vec<String>,
+    /// Copy a host dir into each VM (isolated snapshot): `HOST[:GUEST]`. Repeatable.
+    #[arg(long = "copy", value_name = "HOST[:GUEST]")]
+    pub copy: Vec<String>,
+    /// Do not share the current project directory.
+    #[arg(long)]
+    pub no_project: bool,
 }
 
 /// `airlock ls`

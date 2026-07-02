@@ -13,6 +13,17 @@
 - Registry-backed profiles (`[image] registry`) that push on build and boot from
   the ref — the prerequisite for portable `pack --from-vm` checkpoints.
 
+## Shipped (v0.2 — host integration)
+
+- Interactive sessions run as the non-root `dev` user in a configurable login
+  shell (default **fish**) with passwordless sudo, via `setpriv` (no `su`), env
+  preserved. See `docs/decisions/0002`.
+- `[workspace]` sharing: **copy** (isolated, default) or **bind**/**bind-ro**
+  (live) for the project dir + a `repos` list, plus `up --bind/--copy/--no-project`.
+- `[home]` provisioning: dotfiles + `~/.claude` baked as a secret-filtered subset
+  (default), or copied in (opt-in); auto-detected dotfiles with install-script
+  support.
+
 ## Deferred (not in v0.1)
 
 - **HTTP control plane.** `smolvm serve` exists; a long-running `airlockd` that

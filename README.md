@@ -113,10 +113,37 @@ airlock rm --all             # tear the fleet down
 | `airlock exec <vm> -- <cmd>` | `smolvm exec` | run one command |
 | `airlock ssh <vm> [-- cmd]` | real sshd | a genuine SSH endpoint (scp, editors); needs networking |
 
-`<vm>` is a full name (`airlock-demo-01`) or an ordinal (`1`). The exec-based paths
-are the guaranteed connect method (secrets are injected fresh into the session and
-never persisted). SSH is the optional "real endpoint" — it forwards your secrets
-with `SendEnv` so they reach the session without touching guest disk.
+`<vm>` is a full name (`airlock-demo-01`) or an ordinal (`1`). Every session runs as
+the non-root **`dev`** user in **fish**, with passwordless `sudo`, landing in
+`/home/dev/project` — no `su` needed. Under the hood `exec` runs as root and drops
+to `dev` with `setpriv`, which preserves the environment so injected secrets (and
+arbitrary `.env` vars) survive. SSH logs in as `dev` directly and forwards secrets
+via `SendEnv` so they reach the session without touching guest disk.
+
+## Sharing host directories
+
+By default `airlock up` **copies** the directory you run it in into the VM at
+`/home/dev/project` — an isolated snapshot, so the agent's edits never touch your
+host. Configure it under `[workspace]`, or per-run:
+
+```bash
+airlock up --copy ~/data/seed         # isolated snapshot (default mode)
+airlock up --bind ~/code/app          # live two-way mount at /home/dev/repos/app
+airlock up --bind ~/code/app:/work    # live mount at an explicit guest path
+airlock up --no-project               # don't share the current dir
+```
+
+```toml
+[workspace]
+mode = "copy"                 # "copy" (isolated) | "bind" (live rw) | "bind-ro" | "off"
+project = true                # share the dir you run `airlock up` in
+repos = ["~/code/a", "~/code/b"]   # each → /home/dev/repos/<name>
+exclude = ["node_modules", "target"]   # skipped when copying (keeps it fast)
+```
+
+**copy** is isolated (host untouched); **bind** is a live mount (the agent can
+write your host files — a deliberate, scoped hole). Copies are snapshotted once at
+`up`; pull results back out with `airlock cp <vm>:/path ./`.
 
 ## Configuration (`airlock.toml`)
 
@@ -147,13 +174,26 @@ github = true                                # GH_TOKEN from `gh auth token`
 anthropic_api_key_env = "ANTHROPIC_API_KEY"  # host env var → guest
 # kubeconfig = "~/.kube/config"              # read-only mount into the guest
 
+[home]
+shell = "fish"            # login shell for the dev user (fish/bash/zsh/…)
+# dotfiles = "~/repos/dotfiles"   # auto-detected; baked in (secret-filtered)
+dotfiles_provision = "bake"       # "bake" | "copy" | "off"
+claude = "bake"                   # "bake" (settings only) | "copy" (real ~/.claude) | "off"
+
 [ssh]
 base_port = 2200          # member NN forwards host port base_port+NN → guest :22
 user = "dev"
 
 [mounts]
-volumes = ["./:/home/dev/project"]   # HOST:GUEST[:ro]
+volumes = []              # extra raw bind mounts (HOST:GUEST[:ro]), full control
 ```
+
+Home provisioning (`[home]`) is **isolation-first by default**: dotfiles and
+`~/.claude` are baked as a secret-filtered subset (no credentials — Claude
+authenticates via the injected `ANTHROPIC_API_KEY`). Set `claude = "copy"` /
+`dotfiles_provision = "copy"` to copy the real thing into each VM instead (still a
+VM-local copy; your host is untouched). Dotfiles run an install script
+(`install.sh`/`bootstrap.sh`) if present, else the tree is copied into `dev`'s home.
 
 ## Fleet model
 

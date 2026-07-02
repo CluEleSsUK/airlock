@@ -13,11 +13,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::auth;
-use crate::config::{Config, NetworkPolicy};
+use crate::config::{Config, NetworkPolicy, Provision, ShareMode};
 use crate::error::{Error, Result};
 use crate::image;
 use crate::names::VmName;
-use crate::paths::Layout;
+use crate::paths::{expand_tilde, Layout};
 use crate::ports;
 use crate::secrets::SecretEnv;
 use crate::smolvm::{CreateSpec, ExecSpec, ImageSource, MachineInfo, NetSpec, Smolvm};
@@ -89,6 +89,35 @@ pub type MemberStatus = (Member, Option<MachineInfo>);
 
 /// Secret and non-secret environment injected into an interactive session.
 type SessionEnv = (Vec<SecretEnv>, Vec<(String, String)>);
+
+/// Shell (run as root) that makes the guest hostname resolvable — smolvm gives an
+/// empty `/etc/hosts`, so `sudo` warns `unable to resolve host` without it. Applied
+/// host-side (not baked into the image) so it works even against a cached rootfs.
+const ENSURE_HOSTS: &str = "grep -q \" $(hostname)$\" /etc/hosts 2>/dev/null || \
+     echo \"127.0.0.1 localhost $(hostname)\" >> /etc/hosts 2>/dev/null";
+
+/// One resolved host→guest share.
+#[derive(Clone, Debug)]
+struct Share {
+    host: PathBuf,
+    guest: String,
+    mode: ShareMode,
+}
+
+/// Options controlling `airlock up`.
+#[derive(Clone, Debug, Default)]
+pub struct UpOptions {
+    /// How many VMs to create.
+    pub count: usize,
+    /// Rebuild the base image first.
+    pub rebuild: bool,
+    /// Ad-hoc bind shares (`HOST[:GUEST]`).
+    pub binds: Vec<String>,
+    /// Ad-hoc copy shares (`HOST[:GUEST]`).
+    pub copies: Vec<String>,
+    /// Override whether the project dir is shared (`None` → use config).
+    pub project: Option<bool>,
+}
 
 /// An orchestrator bound to one profile.
 pub struct Fleet {
@@ -169,8 +198,8 @@ impl Fleet {
     /// Bring up `count` new members, building the image first if needed. Each new
     /// member is created, started, and persisted before moving to the next, so a
     /// failure part-way still records what succeeded.
-    pub fn up(&self, count: usize, rebuild: bool) -> Result<Vec<Member>> {
-        let archive = self.ensure_image(rebuild)?;
+    pub fn up(&self, opts: &UpOptions) -> Result<Vec<Member>> {
+        let archive = self.ensure_image(opts.rebuild)?;
         let tag = self.cfg.image_tag(&self.profile);
         let index_path = self.layout.fleet_index(&self.profile);
         let mut index = FleetIndex::load(&index_path)?;
@@ -181,10 +210,19 @@ impl Fleet {
         let ssh_agent = auth::ssh_agent_available();
         let image_src = self.launch_image(&archive);
         let net = self.launch_net();
-        let volumes = self.volumes();
 
-        let mut created = Vec::with_capacity(count);
-        for i in 0..count {
+        // Resolve shares once: binds become create-time volumes, copies run after start.
+        let shares = self.compute_shares(opts);
+        let mut volumes = self.mount_volumes();
+        volumes.extend(self.bind_volumes(&shares));
+        let copies: Vec<Share> = shares
+            .iter()
+            .filter(|s| s.mode == ShareMode::Copy)
+            .cloned()
+            .collect();
+
+        let mut created = Vec::with_capacity(opts.count);
+        for i in 0..opts.count {
             let idx = start + i as u32;
             let name = VmName::member(&self.profile, idx)?;
             let preferred = base.saturating_add(u16::try_from(idx).unwrap_or(u16::MAX));
@@ -206,6 +244,7 @@ impl Fleet {
             self.smolvm.create(&spec)?;
             self.smolvm.start(&name)?;
             self.ensure_sshd(&name);
+            self.provision_member(&name, &copies);
 
             let member = Member {
                 name,
@@ -316,12 +355,22 @@ impl Fleet {
         let member = self.resolve_member(selector)?;
         self.ensure_running(&member)?;
         let (secret_env, plain_env) = self.session_env()?;
+        // Repair /etc/hosts (root), then drop to `dev` (fish) via the login helper,
+        // preserving the injected env. Empty command → login shell.
+        let inner = format!("{ENSURE_HOSTS}; exec /usr/local/bin/airlock-login \"$@\"");
+        let mut wrapped = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            inner,
+            "airlock-login".to_owned(),
+        ];
+        wrapped.extend(command);
         let spec = ExecSpec {
             name: member.name,
-            command,
+            command: wrapped,
             interactive,
             tty: interactive,
-            workdir: None,
+            workdir: Some("/home/dev/project".to_owned()),
             env: plain_env,
             secret_env,
             detach: false,
@@ -404,12 +453,118 @@ impl Fleet {
         }
     }
 
-    fn volumes(&self) -> Vec<String> {
+    /// Raw configured mounts plus the kubeconfig mount (all bind).
+    fn mount_volumes(&self) -> Vec<String> {
         let mut v = self.cfg.mounts.volumes.clone();
         if let Some(km) = auth::kubeconfig_mount(&self.cfg) {
             v.push(km.volume);
         }
         v
+    }
+
+    /// Resolve all host→guest shares for this run (project + repos + CLI flags),
+    /// dropping any whose host does not exist.
+    fn compute_shares(&self, opts: &UpOptions) -> Vec<Share> {
+        let mode = self.cfg.workspace.mode;
+        let mut shares: Vec<Share> = Vec::new();
+
+        let project_on = opts.project.unwrap_or(self.cfg.workspace.project);
+        if project_on && mode != ShareMode::Off {
+            shares.push(Share {
+                host: self.config_dir().to_path_buf(),
+                guest: "/home/dev/project".to_owned(),
+                mode,
+            });
+        }
+        if mode != ShareMode::Off {
+            for repo in &self.cfg.workspace.repos {
+                let host = expand_tilde(repo);
+                if let Some(guest) = guest_under(&host, "repos") {
+                    shares.push(Share { host, guest, mode });
+                }
+            }
+        }
+        for b in &opts.binds {
+            shares.push(parse_share(b, ShareMode::Bind));
+        }
+        for c in &opts.copies {
+            shares.push(parse_share(c, ShareMode::Copy));
+        }
+
+        shares
+            .into_iter()
+            .filter(|s| {
+                let ok = s.host.exists();
+                if !ok {
+                    tracing::warn!(host = %s.host.display(), "share source not found; skipping");
+                }
+                ok
+            })
+            .collect()
+    }
+
+    /// Bind shares rendered as `HOST:GUEST[:ro]` volume args.
+    fn bind_volumes(&self, shares: &[Share]) -> Vec<String> {
+        shares
+            .iter()
+            .filter(|s| s.mode.is_bind())
+            .map(|s| {
+                let ro = if s.mode == ShareMode::BindRo {
+                    ":ro"
+                } else {
+                    ""
+                };
+                format!("{}:{}{}", s.host.display(), s.guest, ro)
+            })
+            .collect()
+    }
+
+    /// Copy-mode shares and home content into a freshly started member. Failures
+    /// are logged, not fatal — the VM is already up and usable.
+    fn provision_member(&self, name: &VmName, copies: &[Share]) {
+        let excludes = &self.cfg.workspace.exclude;
+        for s in copies {
+            tracing::info!(vm = %name, host = %s.host.display(), guest = %s.guest, "copying into VM");
+            if let Err(e) = self
+                .smolvm
+                .copy_tree_in(name, &s.host, &s.guest, excludes, true)
+            {
+                tracing::warn!(vm = %name, error = %e, "copy into VM failed");
+            }
+        }
+
+        if self.cfg.home.claude == Provision::Copy {
+            let src = self
+                .cfg
+                .image
+                .claude_settings
+                .source
+                .clone()
+                .map_or_else(|| expand_tilde("~/.claude"), |s| expand_tilde(&s));
+            let src = std::fs::canonicalize(&src).unwrap_or(src);
+            if src.is_dir() {
+                if let Err(e) = self
+                    .smolvm
+                    .copy_tree_in(name, &src, "/home/dev/.claude", &[], true)
+                {
+                    tracing::warn!(vm = %name, error = %e, "copying ~/.claude failed");
+                }
+            }
+        }
+
+        if self.cfg.home.dotfiles_provision == Provision::Copy {
+            if let Some(src) = image::dotfiles_source(&self.cfg) {
+                // Filter obvious host-access secrets even in copy mode.
+                let deny =
+                    [".ssh", ".aws", ".gnupg", ".netrc", ".git-credentials"].map(str::to_owned);
+                if let Err(e) = self
+                    .smolvm
+                    .copy_tree_in(name, &src, "/home/dev", &deny, true)
+                {
+                    tracing::warn!(vm = %name, error = %e, "copying dotfiles failed");
+                }
+            }
+        }
     }
 
     /// The secret + plain env injected into every interactive session.
@@ -432,9 +587,11 @@ impl Fleet {
         Ok(())
     }
 
-    /// Best-effort start of the guest sshd (only present in airlock-built images).
+    /// Best-effort start of the guest sshd (only present in airlock-built images),
+    /// repairing `/etc/hosts` first so in-session `sudo` doesn't warn.
     fn ensure_sshd(&self, name: &VmName) {
-        let mut spec = ExecSpec::new(name.clone(), vec!["/usr/local/bin/airlock-sshd".to_owned()]);
+        let script = format!("{ENSURE_HOSTS}; exec /usr/local/bin/airlock-sshd");
+        let mut spec = ExecSpec::new(name.clone(), vec!["sh".to_owned(), "-c".to_owned(), script]);
         spec.detach = true;
         if let Err(e) = self.smolvm.exec_capture(&spec) {
             tracing::debug!(vm = %name, error = %e, "guest sshd not started (ssh may be unavailable)");
@@ -450,6 +607,30 @@ impl Fleet {
         }
         Ok(arg.to_owned())
     }
+}
+
+/// Parse a `HOST[:GUEST]` share spec. A `GUEST` is only recognised when it is an
+/// absolute path (so `~/proj` isn't split on a stray colon); otherwise the guest
+/// defaults to `/home/dev/repos/<basename>`.
+fn parse_share(spec: &str, mode: ShareMode) -> Share {
+    if let Some((h, g)) = spec.split_once(':') {
+        if g.starts_with('/') {
+            return Share {
+                host: expand_tilde(h),
+                guest: g.to_owned(),
+                mode,
+            };
+        }
+    }
+    let host = expand_tilde(spec);
+    let guest = guest_under(&host, "repos").unwrap_or_else(|| "/home/dev/project".to_owned());
+    Share { host, guest, mode }
+}
+
+/// `/home/dev/<sub>/<basename-of-host>`, or `None` if `host` has no final component.
+fn guest_under(host: &Path, sub: &str) -> Option<String> {
+    host.file_name()
+        .map(|n| format!("/home/dev/{sub}/{}", n.to_string_lossy()))
 }
 
 pub(crate) fn now_unix() -> i64 {
@@ -512,5 +693,26 @@ mod tests {
         let mut index = FleetIndex::default();
         index.members.push(member("web-01", 1, 0));
         assert!(index.used_ports().is_empty());
+    }
+
+    #[test]
+    fn parse_share_recognises_absolute_guest() {
+        let s = parse_share("/host/a:/home/dev/x", ShareMode::Bind);
+        assert_eq!(s.guest, "/home/dev/x");
+        assert_eq!(s.mode, ShareMode::Bind);
+    }
+
+    #[test]
+    fn parse_share_defaults_guest_under_repos() {
+        let s = parse_share("/host/myrepo", ShareMode::Copy);
+        assert_eq!(s.guest, "/home/dev/repos/myrepo");
+    }
+
+    #[test]
+    fn guest_under_uses_basename() {
+        assert_eq!(
+            guest_under(Path::new("/x/y/foo"), "repos"),
+            Some("/home/dev/repos/foo".to_owned())
+        );
     }
 }

@@ -14,7 +14,7 @@ use airlock::cli::{
     RestoreArgs, SelectorArgs, TargetArgs, UpArgs,
 };
 use airlock::config;
-use airlock::fleet::Fleet;
+use airlock::fleet::{Fleet, UpOptions};
 use airlock::image;
 use airlock::smolvm::Smolvm;
 
@@ -170,7 +170,14 @@ fn cmd_up(args: UpArgs) -> Result<i32> {
         bail!("--count must be at least 1");
     }
     let fleet = open_fleet()?;
-    let members = fleet.up(args.count, args.rebuild)?;
+    let opts = UpOptions {
+        count: args.count,
+        rebuild: args.rebuild,
+        binds: args.bind,
+        copies: args.copy,
+        project: if args.no_project { Some(false) } else { None },
+    };
+    let members = fleet.up(&opts)?;
     println!(
         "Brought up {} VM(s) in profile '{}':",
         members.len(),
@@ -284,8 +291,8 @@ fn cmd_claude(args: PassthroughArgs) -> Result<i32> {
 
 fn cmd_shell(args: TargetArgs) -> Result<i32> {
     let fleet = open_fleet()?;
-    let status =
-        fleet.exec_session(&args.target, vec!["bash".to_owned(), "-l".to_owned()], true)?;
+    // Empty command → `airlock-login` opens the dev user's login shell (fish).
+    let status = fleet.exec_session(&args.target, Vec::new(), true)?;
     Ok(status.code().unwrap_or(0))
 }
 

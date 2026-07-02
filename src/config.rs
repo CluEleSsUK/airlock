@@ -31,7 +31,11 @@ pub struct Config {
     pub secrets: SecretsConfig,
     /// SSH access configuration.
     pub ssh: SshConfig,
-    /// Extra host directory mounts.
+    /// How host directories (project + repos) are shared into VMs.
+    pub workspace: WorkspaceConfig,
+    /// How the guest home is provisioned (shell, dotfiles, Claude config).
+    pub home: HomeConfig,
+    /// Extra raw host directory mounts (always bind).
     pub mounts: MountsConfig,
 }
 
@@ -201,8 +205,6 @@ pub struct SecretsConfig {
     pub github: bool,
     /// Host env var whose value is injected as `ANTHROPIC_API_KEY` (if set).
     pub anthropic_api_key_env: Option<String>,
-    /// Copy `~/.claude/.credentials.json` into the guest if present.
-    pub claude_credentials: bool,
     /// Host kubeconfig to copy into the guest `~/.kube/config` (supports `~`).
     pub kubeconfig: Option<String>,
 }
@@ -213,7 +215,6 @@ impl Default for SecretsConfig {
             env_file: Some(".env".to_owned()),
             github: true,
             anthropic_api_key_env: Some("ANTHROPIC_API_KEY".to_owned()),
-            claude_credentials: true,
             kubeconfig: None,
         }
     }
@@ -244,6 +245,93 @@ impl Default for SshConfig {
 pub struct MountsConfig {
     /// `HOST:GUEST[:ro]` bind mounts.
     pub volumes: Vec<String>,
+}
+
+/// How a host directory is made available inside a VM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShareMode {
+    /// Snapshot-copy into the VM at creation (isolated; host untouched).
+    Copy,
+    /// Live read-write bind mount (edits sync both ways).
+    Bind,
+    /// Live read-only bind mount.
+    BindRo,
+    /// Do not share.
+    Off,
+}
+
+impl ShareMode {
+    /// Whether this mode is a bind mount (vs a copy / off).
+    pub fn is_bind(self) -> bool {
+        matches!(self, Self::Bind | Self::BindRo)
+    }
+}
+
+/// How host home content (dotfiles, Claude config) is provisioned into the guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provision {
+    /// Bake a secret-filtered subset into the image (no credentials).
+    Bake,
+    /// Copy the real thing into the VM at creation (isolated VM-local copy).
+    Copy,
+    /// Do not provision.
+    Off,
+}
+
+/// How host directories (the project you run in, plus `repos`) reach the VM.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkspaceConfig {
+    /// Sharing mode for the project dir and `repos`.
+    pub mode: ShareMode,
+    /// Share the directory you run `airlock up` in as `/home/dev/project`.
+    pub project: bool,
+    /// Extra host dirs to share, each at `/home/dev/repos/<name>`.
+    pub repos: Vec<String>,
+    /// Path fragments to skip when copying (e.g. `node_modules`, `target`).
+    pub exclude: Vec<String>,
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            mode: ShareMode::Copy,
+            project: true,
+            repos: Vec::new(),
+            // Heavy, always-regenerable dirs skipped when copying so `up` stays fast.
+            exclude: ["node_modules", "target", ".venv", "__pycache__", "dist"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+        }
+    }
+}
+
+/// How the guest `dev` home is set up.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HomeConfig {
+    /// Login shell for `dev` (must be installable via apt, e.g. `fish`, `bash`, `zsh`).
+    pub shell: String,
+    /// Host dotfiles directory. Auto-detected from common locations if omitted.
+    pub dotfiles: Option<String>,
+    /// How to provision dotfiles.
+    pub dotfiles_provision: Provision,
+    /// How to provision `~/.claude` (bake subset / copy real / off).
+    pub claude: Provision,
+}
+
+impl Default for HomeConfig {
+    fn default() -> Self {
+        Self {
+            shell: "fish".to_owned(),
+            dotfiles: None,
+            dotfiles_provision: Provision::Bake,
+            claude: Provision::Bake,
+        }
+    }
 }
 
 impl Config {
@@ -412,15 +500,28 @@ policy = "all"    # "off" | "all" | "allow"
 env_file = ".env"                          # inject KEY=VALUE pairs (if the file exists)
 github = true                              # inject `gh auth token` as GH_TOKEN
 anthropic_api_key_env = "ANTHROPIC_API_KEY"  # inject this host env var if present
-claude_credentials = true                  # copy ~/.claude/.credentials.json if present
 # kubeconfig = "~/.kube/config"            # copy into the guest ~/.kube/config
+
+[workspace]
+# How your host dirs reach the VM: "copy" (isolated snapshot) | "bind" (live rw)
+# | "bind-ro" (live read-only) | "off".
+mode = "copy"
+project = true            # share the dir you run `airlock up` in as /home/dev/project
+repos = []                # extra host dirs → /home/dev/repos/<name>, e.g. ["~/code/foo"]
+exclude = ["node_modules", "target", ".venv", "dist"]  # skipped when copying
+
+[home]
+shell = "fish"            # login shell for the `dev` user
+# dotfiles = "~/repos/dotfiles"   # auto-detected from ~/repos/dotfiles, ~/.dotfiles, ~/dotfiles
+dotfiles_provision = "bake"       # "bake" (secret-filtered) | "copy" | "off"
+claude = "bake"                   # "bake" (settings only, no creds) | "copy" (real ~/.claude) | "off"
 
 [ssh]
 base_port = 2200   # member NN forwards host port base_port+NN to guest :22
 user = "dev"
 
 [mounts]
-# Host directories shared into every VM (HOST:GUEST[:ro]):
+# Extra raw bind mounts, full control (HOST:GUEST[:ro]):
 volumes = []
 "#
     )
@@ -453,6 +554,25 @@ mod tests {
         assert_eq!(cfg.name.as_deref(), Some("demo"));
         assert_eq!(cfg.image_tag("demo"), "airlock/demo:latest");
         Ok(())
+    }
+
+    #[test]
+    fn workspace_and_home_defaults() -> anyhow::Result<()> {
+        let cfg: Config = toml::from_str("")?;
+        assert_eq!(cfg.workspace.mode, ShareMode::Copy);
+        assert!(cfg.workspace.project);
+        assert_eq!(cfg.home.shell, "fish");
+        assert_eq!(cfg.home.claude, Provision::Bake);
+        assert_eq!(cfg.home.dotfiles_provision, Provision::Bake);
+        assert!(!cfg.workspace.mode.is_bind());
+        Ok(())
+    }
+
+    #[test]
+    fn share_mode_parses_kebab_case() {
+        let cfg: Config = toml::from_str("[workspace]\nmode = \"bind-ro\"\n").expect("parses");
+        assert_eq!(cfg.workspace.mode, ShareMode::BindRo);
+        assert!(cfg.workspace.mode.is_bind());
     }
 
     #[test]

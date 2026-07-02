@@ -417,6 +417,68 @@ impl Smolvm {
         Ok(())
     }
 
+    /// Stream a host directory's *contents* into `guest_dest` inside the VM — an
+    /// isolated VM-local copy (the host is never mounted). Implemented as
+    /// `tar -C host -cf - . | smolvm exec -i -- sh -c 'tar -x …'`.
+    pub fn copy_tree_in(
+        &self,
+        name: &VmName,
+        host_dir: &Path,
+        guest_dest: &str,
+        excludes: &[String],
+        chown_dev: bool,
+    ) -> Result<()> {
+        let mut tar = Command::new("tar");
+        tar.arg("-C").arg(host_dir);
+        for e in excludes {
+            tar.arg(format!("--exclude=./{e}"));
+            tar.arg(format!("--exclude=*/{e}"));
+        }
+        tar.arg("-cf").arg("-").arg(".");
+        tar.stdout(Stdio::piped()).stderr(Stdio::inherit());
+        let mut tar_child = tar.spawn().map_err(|source| Error::CommandSpawn {
+            cmd: "tar".to_owned(),
+            source,
+        })?;
+        let tar_out = tar_child.stdout.take().ok_or(Error::CommandFailed {
+            cmd: "tar".to_owned(),
+            code: -1,
+        })?;
+
+        let chown = if chown_dev {
+            format!(" && chown -R dev:dev '{guest_dest}'")
+        } else {
+            String::new()
+        };
+        let guest_cmd = format!("mkdir -p '{guest_dest}' && tar -C '{guest_dest}' -xf -{chown}");
+        let args = vec![
+            "machine".to_owned(),
+            "exec".to_owned(),
+            "-i".to_owned(),
+            "--name".to_owned(),
+            name.as_str().to_owned(),
+            "--".to_owned(),
+            "sh".to_owned(),
+            "-c".to_owned(),
+            guest_cmd,
+        ];
+        let mut exec = self.command(&args);
+        exec.stdin(Stdio::from(tar_out));
+        let status = exec.status().map_err(|source| Error::CommandSpawn {
+            cmd: format!("{BIN} machine exec (copy-in)"),
+            source,
+        })?;
+        let _ = tar_child.wait();
+        if !status.success() {
+            return Err(Error::Smolvm {
+                args: format!("machine exec -i --name {} -- tar -x", name.as_str()),
+                code: status.code().unwrap_or(-1),
+                stderr: format!("copy into {guest_dest} failed"),
+            });
+        }
+        Ok(())
+    }
+
     /// `smolvm machine monitor --name NAME …` (foreground, long-running).
     pub fn monitor(&self, name: &VmName, restart_policy: &str) -> Result<ExitStatus> {
         let args = vec![

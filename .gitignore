@@ -2,3 +2,6 @@
 # Airlock-generated build contexts / staged image inputs, if a user runs inside the repo
 /.airlock
 *.smolmachine
+# End-user artifacts created by running airlock inside its own repo (e.g. for testing)
+/airlock.toml
+/.env

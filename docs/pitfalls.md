@@ -45,3 +45,34 @@ Gotchas for humans and agents working on airlock. Cite file:line.
   the host's `localhost:5000` is not reachable as `localhost` from the guest, and
   registry pulls require `--net`. Use a registry reachable from the guest (a real
   one like ghcr.io, or the host gateway address) for registry-backed profiles.
+
+- **Interactive sessions run as `dev` via `setpriv`, not `su`.** `image.rs::login_script`
+  bakes `airlock-login`, which uses `setpriv` because it changes uid/gid without
+  scrubbing the env — `su`/`runuser`/`sudo -u` would drop injected `.env` secrets.
+  If you "fix" it to use `su`, secrets with arbitrary names silently disappear from
+  the session.
+
+- **Copy shares are snapshots taken once at `up`.** `fleet.rs::provision_member`
+  tar-streams the dir into the overlay at creation. Editing the host afterwards does
+  not update the VM (that's the isolation guarantee) — use `mode = "bind"` for live
+  sync, or re-`up`.
+
+- **The guest `/etc/hosts` is empty.** smolvm does not populate it, so `sudo` warns
+  `unable to resolve host <name>`. The repair (`fleet::ENSURE_HOSTS`) is applied
+  **host-side** — the fleet wraps every `exec`/sshd launch in `sh -c 'fix; exec …'`
+  rather than baking it into the image. This is deliberate: see the cache pitfall
+  below. Keep it host-side.
+
+- **Container-build/​smolvm layer caching can serve a stale rootfs.** On this dev
+  host, rebuilding after editing a baked helper script (`airlock-login`/`-sshd`)
+  produced a fresh `COPY` layer, yet booted VMs still ran the *old* script — podman
+  storage + smolvm's content-addressed flatten cache disagreed. Lesson: anything
+  that must reliably take effect on `up` belongs **host-side** (argv airlock
+  constructs), not baked into the image, unless you force `--no-cache`. If a baked
+  change isn't appearing, `docker/podman image prune` and rebuild.
+
+- **Dotfiles/`~/.claude` bake is secret-filtered; copy mode is not (for `~/.claude`).**
+  `image.rs::is_secret_filename` drops `.ssh`, `.aws`, `.gnupg`, `.env*`, keys, etc.
+  during staging. `home.claude = "copy"` deliberately copies the *real* `~/.claude`
+  (including credentials) into the VM — only enable it if credentials-in-sandbox is
+  acceptable.

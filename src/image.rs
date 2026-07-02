@@ -12,13 +12,24 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::config::Config;
+use crate::config::{Config, Provision};
 use crate::error::{Error, Result};
 use crate::paths::{expand_tilde, Layout};
 use crate::toolchains;
 
-/// Filenames that must never be copied into an image layer.
-const SECRET_DENYLIST_EXACT: &[&str] = &[".credentials.json", "id_rsa", "id_ed25519"];
+/// Filenames/dirs that must never be copied into an image layer (secret material
+/// commonly found in `~` and dotfiles repos).
+const SECRET_DENYLIST_EXACT: &[&str] = &[
+    ".credentials.json",
+    "id_rsa",
+    "id_ed25519",
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".netrc",
+    ".git-credentials",
+    ".claude.json",
+];
 const SECRET_DENYLIST_SUFFIX: &[&str] = &[".key", ".pem"];
 
 /// Render the Dockerfile for `cfg`. Pure — depends only on the config.
@@ -46,15 +57,31 @@ pub fn render_dockerfile(cfg: &Config) -> String {
          ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8\n\n",
     );
 
+    // Login shell for `dev` (install unless it's bash, which is already present).
+    let (shell_pkg, shell_path) = shell_spec(&cfg.home.shell);
+    if let Some(pkg) = &shell_pkg {
+        s.push_str(&format!(
+            "RUN apt-get update && apt-get install -y --no-install-recommends {pkg} \\\n\
+             \x20&& rm -rf /var/lib/apt/lists/*\n\n"
+        ));
+    }
+
     // Non-root dev user (Ubuntu 24.04 ships a uid-1000 `ubuntu` user we reclaim).
-    s.push_str(
+    s.push_str(&format!(
         "RUN userdel -r ubuntu 2>/dev/null || true \\\n\
-         \x20&& useradd --create-home --shell /bin/bash --uid 1000 dev \\\n\
+         \x20&& useradd --create-home --shell {shell_path} --uid 1000 dev \\\n\
          \x20&& echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-dev \\\n\
-         \x20&& chmod 0440 /etc/sudoers.d/90-dev\n\n",
+         \x20&& chmod 0440 /etc/sudoers.d/90-dev\n\n"
+    ));
+
+    // A helper that drops from root (how `smolvm exec` runs) to `dev` while
+    // preserving the environment — so injected secrets survive and you never `su`.
+    s.push_str(
+        "COPY airlock-login /usr/local/bin/airlock-login\n\
+         RUN chmod +x /usr/local/bin/airlock-login\n\n",
     );
 
-    // sshd: key-only login for `dev`, and accept the env vars airlock forwards.
+    // sshd: key-only login for `dev`; accept any forwarded env (single-tenant box).
     s.push_str(
         "RUN mkdir -p /run/sshd /home/dev/.ssh && chmod 700 /home/dev/.ssh\n\
          COPY authorized_keys /home/dev/.ssh/authorized_keys\n\
@@ -65,11 +92,11 @@ pub fn render_dockerfile(cfg: &Config) -> String {
          \x20     'PermitRootLogin no' \\\n\
          \x20     'PasswordAuthentication no' \\\n\
          \x20     'PubkeyAuthentication yes' \\\n\
-         \x20     'AcceptEnv GH_TOKEN GITHUB_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN KUBECONFIG LANG LC_*' \\\n\
+         \x20     'AcceptEnv *' \\\n\
          \x20     'X11Forwarding no' \\\n\
          \x20     > /etc/ssh/sshd_config.d/airlock.conf\n\
-         RUN printf '#!/bin/sh\\nmkdir -p /run/sshd\\nexec /usr/sbin/sshd -D -e\\n' \\\n\
-         \x20      > /usr/local/bin/airlock-sshd && chmod +x /usr/local/bin/airlock-sshd\n\n",
+         COPY airlock-sshd /usr/local/bin/airlock-sshd\n\
+         RUN chmod +x /usr/local/bin/airlock-sshd\n\n",
     );
 
     // Toolchains, in dependency order.
@@ -102,12 +129,28 @@ pub fn render_dockerfile(cfg: &Config) -> String {
         s.push('\n');
     }
 
-    // Baked non-secret Claude settings, for both the root (exec) and dev (ssh) homes.
-    s.push_str(
-        "COPY claude-settings/ /home/dev/.claude/\n\
-         COPY claude-settings/ /root/.claude/\n\
-         RUN chown -R dev:dev /home/dev/.claude\n\n",
-    );
+    // Baked non-secret Claude settings (bake mode only), into both homes.
+    if cfg.home.claude == Provision::Bake {
+        s.push_str(
+            "COPY claude-settings/ /home/dev/.claude/\n\
+             COPY claude-settings/ /root/.claude/\n\
+             RUN chown -R dev:dev /home/dev/.claude\n\n",
+        );
+    }
+
+    // Baked dotfiles (bake mode only): run an install script if present, else copy
+    // the (secret-filtered) tree into the dev home.
+    if cfg.home.dotfiles_provision == Provision::Bake {
+        s.push_str(
+            "COPY --chown=dev:dev dotfiles/ /home/dev/.airlock-dotfiles/\n\
+             RUN d=/home/dev/.airlock-dotfiles; \\\n\
+             \x20   if   [ -x \"$d/install.sh\" ];   then (cd \"$d\" && HOME=/home/dev runuser -u dev -- ./install.sh)   || true; \\\n\
+             \x20   elif [ -x \"$d/install\" ];      then (cd \"$d\" && HOME=/home/dev runuser -u dev -- ./install)      || true; \\\n\
+             \x20   elif [ -x \"$d/bootstrap.sh\" ]; then (cd \"$d\" && HOME=/home/dev runuser -u dev -- ./bootstrap.sh) || true; \\\n\
+             \x20   else cp -a \"$d\"/. /home/dev/ 2>/dev/null || true; fi; \\\n\
+             \x20   rm -f /home/dev/.airlock-keep; chown -R dev:dev /home/dev\n\n",
+        );
+    }
 
     // A friendly default working directory.
     s.push_str(
@@ -170,15 +213,91 @@ fn stage_context(cfg: &Config, layout: &Layout, profile: &str, ctx: &Path) -> Re
         source,
     })?;
 
-    // Sanitised Claude settings.
+    // The privilege-drop launcher, parameterised by the chosen login shell, and
+    // the sshd launcher — both staged as files to avoid Dockerfile printf escaping.
+    let (_, shell_path) = shell_spec(&cfg.home.shell);
+    std::fs::write(
+        ctx.join("airlock-login"),
+        login_script(&cfg.home.shell, &shell_path),
+    )?;
+    std::fs::write(ctx.join("airlock-sshd"), sshd_script())?;
+
+    // Sanitised Claude settings (bake mode only). Always create the dir + marker so
+    // `COPY claude-settings/` has content (an empty COPY source errors in Docker).
     let settings_dir = ctx.join("claude-settings");
     std::fs::create_dir_all(&settings_dir)?;
-    // Marker so `COPY claude-settings/` always has content even when nothing else
-    // is staged (an empty COPY source is an error in Docker).
     std::fs::write(settings_dir.join(".airlock-keep"), b"")?;
-    stage_claude_settings(cfg, &settings_dir)?;
+    if cfg.home.claude == Provision::Bake {
+        stage_claude_settings(cfg, &settings_dir)?;
+    }
+
+    // Dotfiles (bake mode only), same marker treatment.
+    let dotfiles_dir = ctx.join("dotfiles");
+    std::fs::create_dir_all(&dotfiles_dir)?;
+    std::fs::write(dotfiles_dir.join(".airlock-keep"), b"")?;
+    if cfg.home.dotfiles_provision == Provision::Bake {
+        stage_dotfiles(cfg, &dotfiles_dir)?;
+    }
 
     Ok(())
+}
+
+/// The apt package (if any) and absolute path for a login shell name.
+pub fn shell_spec(name: &str) -> (Option<String>, String) {
+    match name {
+        "bash" => (None, "/bin/bash".to_owned()),
+        "fish" => (Some("fish".to_owned()), "/usr/bin/fish".to_owned()),
+        "zsh" => (Some("zsh".to_owned()), "/usr/bin/zsh".to_owned()),
+        other => (Some(other.to_owned()), format!("/usr/bin/{other}")),
+    }
+}
+
+/// The `airlock-login` script: drop root→dev preserving env, then exec. The
+/// `/etc/hosts` hostname repair is applied host-side by the fleet wrapper (see
+/// `fleet::ENSURE_HOSTS`) so it works even against a cached image.
+fn login_script(shell: &str, shell_path: &str) -> String {
+    format!(
+        "#!/bin/sh\n\
+         # Drop from root (how `smolvm exec` runs) to the dev user, preserving the\n\
+         # environment so injected secrets survive, and fixing HOME. No `su` needed.\n\
+         [ \"$#\" -eq 0 ] && set -- {shell} -l\n\
+         exec setpriv --reuid=dev --regid=dev --init-groups \\\n\
+         \x20 env HOME=/home/dev USER=dev LOGNAME=dev SHELL={shell_path} \"$@\"\n"
+    )
+}
+
+/// The `airlock-sshd` launcher (runs as root).
+fn sshd_script() -> String {
+    "#!/bin/sh\nmkdir -p /run/sshd\nexec /usr/sbin/sshd -D -e\n".to_owned()
+}
+
+/// Resolve the dotfiles source: explicit config, else common auto-detect locations.
+pub fn dotfiles_source(cfg: &Config) -> Option<std::path::PathBuf> {
+    if let Some(dir) = &cfg.home.dotfiles {
+        let p = expand_tilde(dir);
+        return p.is_dir().then_some(p);
+    }
+    for cand in ["~/repos/dotfiles", "~/.dotfiles", "~/dotfiles"] {
+        let p = expand_tilde(cand);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Copy the dotfiles tree into `dest`, filtering out secret material.
+fn stage_dotfiles(cfg: &Config, dest: &Path) -> Result<usize> {
+    let Some(source) = dotfiles_source(cfg) else {
+        tracing::info!("no dotfiles directory found; skipping dotfiles bake");
+        return Ok(0);
+    };
+    let source = std::fs::canonicalize(&source).unwrap_or(source);
+    if !source.is_dir() {
+        return Ok(0);
+    }
+    tracing::info!(source = %source.display(), "staging dotfiles");
+    copy_filtered(&source, dest)
 }
 
 /// Copy the profile's allowed Claude settings into `dest`, filtering out secrets.
@@ -354,6 +473,47 @@ mod tests {
         assert!(df.contains("useradd --create-home"));
         assert!(df.contains("authorized_keys"));
         assert!(df.contains("COPY claude-settings/ /home/dev/.claude/"));
+    }
+
+    #[test]
+    fn dockerfile_installs_fish_and_login_helper_by_default() {
+        let df = render_dockerfile(&Config::default());
+        assert!(df.contains("install -y --no-install-recommends fish"));
+        assert!(df.contains("useradd --create-home --shell /usr/bin/fish"));
+        assert!(df.contains("COPY airlock-login /usr/local/bin/airlock-login"));
+        assert!(df.contains("AcceptEnv *"));
+        assert!(df.contains("/home/dev/.airlock-dotfiles"));
+    }
+
+    #[test]
+    fn bash_shell_needs_no_extra_install() {
+        let cfg: Config = cfg_with("[home]\nshell = \"bash\"\n");
+        let df = render_dockerfile(&cfg);
+        assert!(df.contains("--shell /bin/bash"));
+        assert!(!df.contains("--no-install-recommends bash "));
+    }
+
+    #[test]
+    fn claude_off_skips_the_bake() {
+        let df = render_dockerfile(&cfg_with("[home]\nclaude = \"off\"\n"));
+        assert!(!df.contains("COPY claude-settings/"));
+    }
+
+    #[test]
+    fn shell_spec_resolves_known_shells() {
+        assert_eq!(
+            shell_spec("fish"),
+            (Some("fish".to_owned()), "/usr/bin/fish".to_owned())
+        );
+        assert_eq!(shell_spec("bash"), (None, "/bin/bash".to_owned()));
+    }
+
+    #[test]
+    fn login_script_drops_to_dev_preserving_env() {
+        let s = login_script("fish", "/usr/bin/fish");
+        assert!(s.contains("setpriv --reuid=dev --regid=dev --init-groups"));
+        assert!(s.contains("HOME=/home/dev"));
+        assert!(s.contains("set -- fish -l"));
     }
 
     #[test]
