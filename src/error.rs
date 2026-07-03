@@ -129,6 +129,17 @@ pub enum Error {
         source: Box<dotenvy::Error>,
     },
 
+    /// A file could not be staged into the image build context (dotfiles / Claude
+    /// settings). Carries the offending path so the user knows what to fix.
+    #[error("failed to stage {path} into the build context")]
+    Stage {
+        /// The host path that could not be read or written.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// A referenced VM is not part of the fleet.
     #[error("VM {name:?} is not part of fleet {profile:?}")]
     VmNotFound {

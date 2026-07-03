@@ -57,6 +57,19 @@ pub fn render_dockerfile(cfg: &Config) -> String {
          ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8\n\n",
     );
 
+    // Trust GitHub's SSH host keys up front so `git`/`ssh` to github.com never
+    // stalls on an interactive fingerprint prompt — a coding agent can't answer
+    // one, so it surfaces as a stuck popup. Pulled over HTTPS from GitHub's
+    // authoritative meta API (TLS-verified), not `ssh-keyscan` (which is
+    // unauthenticated trust-on-first-use). Best-effort: a meta hiccup warns but
+    // must not fail the build.
+    s.push_str(
+        "RUN if curl -fsSL https://api.github.com/meta -o /tmp/gh-meta.json; then \\\n\
+         \x20     jq -r '.ssh_keys[] | \"github.com \" + .' /tmp/gh-meta.json >> /etc/ssh/ssh_known_hosts \\\n\
+         \x20     && rm -f /tmp/gh-meta.json; \\\n\
+         \x20   else echo 'airlock: warning: could not preload github.com SSH host keys' >&2; fi\n\n",
+    );
+
     // Login shell for `dev` (install unless it's bash, which is already present).
     let (shell_pkg, shell_path) = shell_spec(&cfg.home.shell);
     if let Some(pkg) = &shell_pkg {
@@ -332,6 +345,12 @@ fn stage_claude_settings(cfg: &Config, dest: &Path) -> Result<usize> {
 
 /// Recursively copy `src` → `dst`, skipping secret-looking filenames. Returns the
 /// number of regular files copied.
+///
+/// Baking home content is a best-effort convenience, so an individual entry we
+/// cannot read (a stray socket, a `000`-mode file, or a symlink to a privileged
+/// or secret target) is warned about and skipped rather than aborting the whole
+/// `airlock build`. Failures writing into our own build context are fatal and
+/// carry the offending path.
 fn copy_filtered(src: &Path, dst: &Path) -> Result<usize> {
     let name = src
         .file_name()
@@ -342,19 +361,43 @@ fn copy_filtered(src: &Path, dst: &Path) -> Result<usize> {
     }
 
     if src.is_dir() {
-        std::fs::create_dir_all(dst)?;
+        std::fs::create_dir_all(dst).map_err(|source| Error::Stage {
+            path: dst.to_path_buf(),
+            source,
+        })?;
+        let entries = match std::fs::read_dir(src) {
+            Ok(entries) => entries,
+            Err(source) => {
+                tracing::warn!(path = %src.display(), error = %source, "skipping unreadable directory while staging");
+                return Ok(0);
+            }
+        };
         let mut count = 0;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
+        for entry in entries {
+            let entry = entry.map_err(|source| Error::Stage {
+                path: src.to_path_buf(),
+                source,
+            })?;
             count += copy_filtered(&entry.path(), &dst.join(entry.file_name()))?;
         }
         Ok(count)
     } else if src.is_file() {
         if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|source| Error::Stage {
+                path: parent.to_path_buf(),
+                source,
+            })?;
         }
-        std::fs::copy(src, dst)?;
-        Ok(1)
+        // Read failures here (EACCES on the source, a dangling symlink) are the
+        // user's data, not our bug — warn and skip so one bad file never bricks
+        // the build.
+        match std::fs::copy(src, dst) {
+            Ok(_) => Ok(1),
+            Err(source) => {
+                tracing::warn!(path = %src.display(), error = %source, "skipping unreadable file while staging");
+                Ok(0)
+            }
+        }
     } else {
         Ok(0)
     }
@@ -474,6 +517,14 @@ mod tests {
         assert!(df.contains("useradd --create-home"));
         assert!(df.contains("authorized_keys"));
         assert!(df.contains("COPY claude-settings/ /home/dev/.claude/"));
+    }
+
+    #[test]
+    fn preloads_github_ssh_host_keys() {
+        // github.com trusted up front so agents never hit a fingerprint prompt.
+        let df = render_dockerfile(&Config::default());
+        assert!(df.contains("https://api.github.com/meta"));
+        assert!(df.contains(">> /etc/ssh/ssh_known_hosts"));
     }
 
     #[test]
