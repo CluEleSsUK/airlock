@@ -46,7 +46,7 @@ pub fn render_dockerfile(cfg: &Config) -> String {
     // Base packages.
     s.push_str(
         "RUN apt-get update && apt-get install -y --no-install-recommends \\\n\
-         \x20     ca-certificates curl wget git jq unzip xz-utils gnupg \\\n\
+         \x20     ca-certificates curl wget git jq unzip xz-utils gnupg vim \\\n\
          \x20     openssh-server sudo tini build-essential pkg-config locales \\\n\
          \x20&& rm -rf /var/lib/apt/lists/*\n\n",
     );
@@ -462,6 +462,7 @@ mod tests {
     fn dockerfile_includes_all_toolchains_by_default() {
         let df = render_dockerfile(&Config::default());
         assert!(df.starts_with("FROM ubuntu:24.04"));
+        assert!(df.contains("ca-certificates curl wget git jq unzip xz-utils gnupg vim"));
         assert!(df.contains("go1.26.0.linux-amd64"));
         assert!(df.contains("setup_22.x"));
         assert!(df.contains("npm install -g pnpm typescript"));

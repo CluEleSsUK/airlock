@@ -110,10 +110,18 @@ pub fn rust_install(channel: &str) -> String {
     )
 }
 
-/// Claude Code, installed globally via npm (requires the Node runtime).
+/// Claude Code, installed via npm into a **dev-owned** global prefix (requires
+/// the Node runtime). Installing `-g` as root lands it in the root-owned `/usr`
+/// prefix; Claude then runs as `dev` and its auto-updater fails with "no write
+/// permission to npm prefix". A per-user prefix plus a matching `~/.npmrc` keeps
+/// `npm prefix -g` writable for `dev`, so self-update works.
 pub fn claude_install() -> String {
-    "# Claude Code\n\
-     RUN npm install -g @anthropic-ai/claude-code\n"
+    "# Claude Code (into a dev-owned npm prefix so auto-update can write)\n\
+     RUN mkdir -p /home/dev/.npm-global \\\n\
+     \x20&& printf 'prefix=/home/dev/.npm-global\\n' > /home/dev/.npmrc \\\n\
+     \x20&& chown -R dev:dev /home/dev/.npm-global /home/dev/.npmrc \\\n\
+     \x20&& HOME=/home/dev runuser -u dev -- npm install -g @anthropic-ai/claude-code\n\
+     ENV PATH=/home/dev/.npm-global/bin:$PATH\n"
         .to_owned()
 }
 
@@ -153,5 +161,15 @@ mod tests {
         assert!(node_runtime("22").contains("setup_22.x"));
         assert!(rust_install("stable").contains("--default-toolchain stable"));
         assert!(claude_install().contains("@anthropic-ai/claude-code"));
+    }
+
+    #[test]
+    fn claude_installs_into_a_dev_owned_prefix_for_auto_update() {
+        let frag = claude_install();
+        // Installed as dev, not root, into a dev-owned prefix on PATH.
+        assert!(frag.contains("runuser -u dev -- npm install -g @anthropic-ai/claude-code"));
+        assert!(frag.contains("prefix=/home/dev/.npm-global"));
+        assert!(frag.contains("chown -R dev:dev /home/dev/.npm-global /home/dev/.npmrc"));
+        assert!(frag.contains("ENV PATH=/home/dev/.npm-global/bin:$PATH"));
     }
 }
